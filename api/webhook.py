@@ -107,15 +107,22 @@ class handler(BaseHTTPRequestHandler):
                         請限制在 120 字以內。
                         """
                         
-                        try:
-                            # 呼叫 Gemini
-                            response = client.models.generate_content(
-                                model='gemini-1.5-flash',
-                                contents=prompt
-                            )
-                            ai_reply = response.text
-                        except Exception as e:
-                            ai_reply = f"AI 分析失敗: {str(e)}"
+                        # 呼叫 Gemini (自動嘗試不同模型名稱)
+try:
+    # 優先嘗試最穩定的版本
+    response = client.models.generate_content(
+        model='gemini-1.5-flash-001',
+        contents=prompt
+    )
+except Exception:
+    try:
+        # 如果失敗，嘗試最新的 Pro 版
+        response = client.models.generate_content(
+            model='gemini-1.5-pro',
+            contents=prompt
+        )
+    except Exception as e:
+        response = type('obj', (object,), {'text': f"AI 模型連線失敗: {str(e)}"})
 
                         # 5. 回傳最終報告
                         final_msg = f"📊 **{stock_id} 分析報告**\n💰 現價：{price}\n\n{ai_reply}\n\n{news_info}"
