@@ -3,14 +3,14 @@ import os
 import json
 import requests
 import twstock
-from google import genai  # 使用新版 SDK
-from duckduckgo_search import DDGS
+from google import genai
+from bs4 import BeautifulSoup
 
 # --- 環境變數 ---
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
-# --- 初始化新版 Gemini Client ---
+# --- 初始化 Gemini ---
 client = genai.Client(api_key=GEMINI_API_KEY)
 
 # --- 輔助函式：發送 TG 訊息 ---
@@ -18,111 +18,118 @@ def send_telegram_message(chat_id, text):
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
     try:
-        requests.post(url, json=payload, timeout=5)
+        requests.post(url, json=payload, timeout=3)
     except Exception as e:
-        print(f"Telegram 发送失败: {e}")
+        print(f"TG Send Error: {e}")
 
-# --- 輔助函式：搜尋新聞 ---
+# --- 關鍵修正：改用 Google News RSS (速度快、不擋IP) ---
 def search_news(stock_id):
-    news_summary = ""
     try:
-        with DDGS() as ddgs:
-            # 簡化搜尋邏輯以避免超時，只搜一次綜合關鍵字
-            keywords = f"{stock_id} 股票新聞 site:cnyes.com OR site:moneydj.com"
-            results = list(ddgs.text(keywords, region='tw-tzh', max_results=2))
+        # 針對台股代號搜尋 (例如: 2330 台積電)
+        url = f"https://news.google.com/rss/search?q={stock_id}+tw+stock&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
+        response = requests.get(url, timeout=4) # 設定 4 秒超時，避免卡死
+        
+        if response.status_code == 200:
+            soup = BeautifulSoup(response.content, features="xml")
+            items = soup.find_all("item", limit=3) # 只抓最新的 3 則
             
-            if results:
-                news_summary += "【焦點新聞】：\n"
-                for r in results:
-                    news_summary += f"- [{r['title']}]({r['href']})\n"
-            else:
-                news_summary = "（暫無重大新聞）"
+            if not items:
+                return "（無相關新聞）"
                 
+            news_text = "【最新新聞】：\n"
+            for item in items:
+                title = item.title.text
+                # 清理標題中多餘的來源名稱 (例如 "- Yahoo奇摩股市")
+                title = title.split(" - ")[0]
+                news_text += f"• {title}\n"
+            return news_text
+            
     except Exception as e:
-        print(f"News Error: {e}")
-        news_summary = "（新聞搜尋連線逾時，跳過分析）"
+        print(f"RSS Search Error: {e}")
+        return "（新聞連線異常，跳過分析）"
     
-    return news_summary
+    return "（查無資料）"
 
 # --- 核心處理邏輯 ---
 class handler(BaseHTTPRequestHandler):
     def do_POST(self):
         try:
-            # 1. 安全防護：先檢查有沒有收到資料
             content_length = int(self.headers.get('Content-Length', 0))
             if content_length == 0:
-                self.send_response(200)
-                self.end_headers()
-                self.wfile.write(b'Empty Request')
-                return
+                self.send_response(200); self.end_headers(); return
 
-            # 2. 讀取資料
             post_data = self.rfile.read(content_length)
             try:
                 data = json.loads(post_data.decode('utf-8'))
-            except json.JSONDecodeError:
-                # 這是解決 500 Error 的關鍵：如果資料不是 JSON，優雅結束
-                self.send_response(200)
-                self.end_headers()
-                self.wfile.write(b'Invalid JSON')
-                return
+            except:
+                self.send_response(200); self.end_headers(); return
 
-            # 3. 處理 TG 訊息
             if "message" in data:
                 chat_id = data["message"]["chat"]["id"]
                 user_text = data["message"].get("text", "").strip()
 
+                # 收到股票代號
                 if user_text.isdigit() and len(user_text) == 4:
                     stock_id = user_text
-                    send_telegram_message(chat_id, f"🔍 收到代號 {stock_id}，正在分析數據與新聞...請稍候")
-
-                    # A. 抓股價
-                    stock = twstock.realtime.get(stock_id)
                     
-                    if stock['success']:
+                    # 1. 先回報「收到指令」(避免使用者以為當機)
+                    send_telegram_message(chat_id, f"🔍 收到 {stock_id}，正在分析中...")
+
+                    # 2. 抓股價 (twstock)
+                    try:
+                        stock = twstock.realtime.get(stock_id)
+                    except:
+                        stock = {'success': False} # 防爆
+
+                    if stock.get('success'):
                         price = stock['realtime']['latest_trade_price']
-                        # 若盤中無成交價，嘗試取最佳買賣價
+                        # 處理無成交價的情況
                         if price == '-' and stock['realtime']['best_bid_price']:
                             price = stock['realtime']['best_bid_price'][0]
-                        
-                        market_info = f"股票：{stock_id} | 現價：{price}"
+                        elif price == '-':
+                            price = "暫無報價"
 
-                        # B. 搜新聞
+                        # 3. 搜新聞 (使用穩定的 RSS)
                         news_info = search_news(stock_id)
 
-                        # C. Gemini 分析 (新版語法)
+                        # 4. Gemini 綜合分析
                         prompt = f"""
-                        你是嚴格的台股交易教練。
-                        【數據】{market_info}
-                        【新聞】{news_info}
+                        你是嚴格的台股教練。
+                        股票：{stock_id}
+                        現價：{price}
+                        新聞：
+                        {news_info}
                         
-                        請根據數據與新聞，執行「策略漏斗分析」：
-                        1. 技術面：漲跌動能如何？
-                        2. 消息面：是否有法人連買或利多？
-                        3. 操作建議：給出一個明確的指令（買進/觀望/逃跑）。
-                        請用繁體中文，100字以內。
+                        請根據以上資訊，用『繁體中文』進行【策略漏斗分析】：
+                        1. 技術與動能判斷。
+                        2. 新聞面解讀 (利多/利空)。
+                        3. 給出明確的操作指令 (買進/觀望/賣出)。
+                        請限制在 120 字以內。
                         """
                         
-                        # 新版 API 呼叫方式
-                        response = client.models.generate_content(
-                            model='gemini-1.5-flash',
-                            contents=prompt
-                        )
-                        
-                        final_reply = f"📊 **{stock_id} 分析報告**\n💰 現價：{price}\n\n{response.text}\n\n{news_info}"
-                        send_telegram_message(chat_id, final_reply)
+                        try:
+                            # 呼叫 Gemini
+                            response = client.models.generate_content(
+                                model='gemini-1.5-flash',
+                                contents=prompt
+                            )
+                            ai_reply = response.text
+                        except Exception as e:
+                            ai_reply = f"AI 分析失敗: {str(e)}"
+
+                        # 5. 回傳最終報告
+                        final_msg = f"📊 **{stock_id} 分析報告**\n💰 現價：{price}\n\n{ai_reply}\n\n{news_info}"
+                        send_telegram_message(chat_id, final_msg)
 
                     else:
-                        send_telegram_message(chat_id, f"❌ 找不到 {stock_id} 的即時報價，請確認代號。")
+                        send_telegram_message(chat_id, f"❌ 找不到代號 {stock_id}，請確認是否正確。")
 
-            # 4. 回應 Vercel (打卡下班)
             self.send_response(200)
             self.send_header('Content-type', 'application/json')
             self.end_headers()
             self.wfile.write(json.dumps({'status': 'ok'}).encode('utf-8'))
 
         except Exception as e:
-            # 最後一道防線：印出錯誤但不讓伺服器崩潰
             print(f"Critical Error: {e}")
-            self.send_response(200) # 回傳 200 騙過 Telegram 避免它一直重試
+            self.send_response(200)
             self.end_headers()
