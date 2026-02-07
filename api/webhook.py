@@ -29,7 +29,7 @@ def send_telegram_message(chat_id, text):
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown", "disable_web_page_preview": True}
     try:
-        requests.post(url, json=payload, timeout=2) # 傳送限時 2 秒
+        requests.post(url, json=payload, timeout=2)
     except Exception as e:
         print(f"[ERROR] 發送訊息失敗: {e}")
 
@@ -96,7 +96,7 @@ def task_technical_analysis(stock_id):
         }
     except: return None
 
-# --- [任務 B] 新聞抓取 ---
+# --- [任務 B] 新聞抓取 (過濾垃圾連結) ---
 def task_fetch_news(url):
     res_list = []
     try:
@@ -107,6 +107,11 @@ def task_fetch_news(url):
             for item in items:
                 title = item.title.text.split(" - ")[0]
                 link = item.link.text
+                
+                # 過濾掉 sitemap 或 xml 結尾的垃圾連結
+                if "sitemap" in link or link.endswith(".xml"):
+                    continue
+
                 source = "媒體"
                 if "cnyes" in link: source = "鉅亨"
                 elif "moneydj" in link: source = "MoneyDJ"
@@ -118,13 +123,12 @@ def task_fetch_news(url):
     except: pass
     return res_list
 
-# --- [任務 C] Gemini 生成 (適配 2.5/3.0 新模型) ---
+# --- [任務 C] Gemini 生成 (放寬限制，確保完整回答) ---
 def task_ask_gemini(prompt):
-    # 新版模型清單：優先使用 2.5 Flash
     model_priority = [
-        'gemini-2.5-flash',       # 主力：速度快、智商高
-        'gemini-2.5-flash-lite',  # 備援：極速輕量版
-        'gemini-3-flash-preview'  # 嘗鮮：最新預覽版
+        'gemini-2.5-flash',       # 主力
+        'gemini-2.5-flash-lite',  # 備援
+        'gemini-3-flash-preview'  # 嘗鮮
     ]
     
     for model_name in model_priority:
@@ -133,22 +137,23 @@ def task_ask_gemini(prompt):
             model = genai.GenerativeModel(
                 model_name,
                 generation_config=genai.types.GenerationConfig(
-                    max_output_tokens=250, # 限制字數，逼它講重點
-                    temperature=0.5
+                    max_output_tokens=800, # 🔥 放寬字數限制，避免話講一半
+                    temperature=0.7        # 稍微提高創造力，讓語句更通順
                 )
             )
             response = model.generate_content(prompt)
-            return f"(🤖 {model_name})\n{response.text}" # 回傳時標註使用的模型
+            # 確保回傳內容不為空
+            if response.text:
+                return f"(🤖 {model_name})\n{response.text}"
         except Exception as e:
             print(f"[AI ERROR] {model_name} 失敗: {e}")
-            continue # 失敗就試下一個
+            continue
             
     return None
 
 # --- 核心處理邏輯 ---
 class handler(BaseHTTPRequestHandler):
     def do_POST(self):
-        # ⏱️ 計時開始
         start_total = time.time()
         
         try:
@@ -179,10 +184,10 @@ class handler(BaseHTTPRequestHandler):
                     url_tw = f"https://news.google.com/rss/search?q={term_tw}+({tw_sources})+訂單+外資+when:1d&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
                     url_en = f"https://news.google.com/rss/search?q={stock_id}+Taiwan+({en_sources})+supply+chain+when:1d&hl=en-US&gl=US&ceid=US:en"
 
-                    send_telegram_message(chat_id, f"⚡ v3.8 新引擎分析：{stock_id} {stock_name}...")
+                    send_telegram_message(chat_id, f"⚡ v3.9 穩定分析中：{stock_id} {stock_name}...")
 
                     # ==========================================
-                    # 🚀 階段一：平行抓資料 (目標 3 秒內)
+                    # 🚀 階段一：平行抓資料 (3秒內)
                     # ==========================================
                     tech_data = None
                     list_tw = []
@@ -193,13 +198,11 @@ class handler(BaseHTTPRequestHandler):
                         future_tech = executor.submit(task_technical_analysis, stock_id)
                         future_news_tw = executor.submit(task_fetch_news, url_tw)
                         future_news_en = executor.submit(task_fetch_news, url_en)
-                        
                         def get_rt():
                             try: return twstock.realtime.get(stock_id)
                             except: return {'success': False}
                         future_rt = executor.submit(get_rt)
 
-                        # 等待資料
                         try: tech_data = future_tech.result(timeout=3.0)
                         except: pass
                         try: list_tw = future_news_tw.result(timeout=3.0)
@@ -211,8 +214,7 @@ class handler(BaseHTTPRequestHandler):
 
                     # 資料處理
                     if stock_rt.get('success'):
-                        if not stock_name: 
-                            stock_name = stock_rt.get('info', {}).get('name', '')
+                        if not stock_name: stock_name = stock_rt.get('info', {}).get('name', '')
                         try: price = float(stock_rt['realtime']['latest_trade_price'])
                         except: 
                             try: price = float(stock_rt['realtime']['best_bid_price'][0])
@@ -236,22 +238,27 @@ class handler(BaseHTTPRequestHandler):
                     if not news_info: news_info = "無權威新聞"
 
                     # ==========================================
-                    # 🚀 階段二：Gemini 2.5 極速生成 (目標 4 秒內)
+                    # 🚀 階段二：Gemini 生成 (延長至 7 秒)
                     # ==========================================
-                    print("[DEBUG] 呼叫 Gemini 2.5/3.0...")
+                    print("[DEBUG] 呼叫 Gemini...")
                     
+                    # 🔥 Prompt 優化：命令它直接開始分析，不要說廢話
                     prompt = f"""
-                    角色：嚴格量化教練。標的：{stock_id} {stock_name}
-                    數據：{price} (漲{change_pct:.2f}%)
-                    技術：{tech_str}
-                    量能：{vol_str}
-                    新聞：{news_info}
+                    你現在是量化交易系統。直接輸出分析結果，不要說「好的」或「以下是分析」。
                     
-                    請用"條列式"簡答：
-                    1.【產業】供應鏈地位？
-                    2.【量價】量能倍數{tech_data['vol_ratio'] if tech_data else 'N/A'}。真突破或虛漲？K棒危險嗎？
-                    3.【籌碼】法人動向？
-                    4.【指令】(買進/觀望/賣出)。保命價{round(safety_price, 2)}。
+                    【標的】{stock_id} {stock_name}
+                    【數據】現價 {price} (漲幅 {change_pct:.2f}%)
+                    【技術】{tech_str}
+                    【量能】{vol_str}
+                    【新聞】{news_info}
+                    
+                    請執行以下分析：
+                    1. **供應鏈地位**：說明關鍵客戶與產業地位。
+                    2. **量價診斷**：根據量能倍數 ({tech_data['vol_ratio'] if tech_data else 'N/A'}) 與 K棒型態，判斷是真突破還是虛漲？
+                    3. **籌碼判斷**：根據新聞判斷法人動向。
+                    4. **操作指令**：(買進/觀望/賣出) 與 保命價 {round(safety_price, 2)}。
+                    
+                    請用繁體中文，條列式回答。
                     """
                     
                     ai_reply = None
@@ -259,10 +266,10 @@ class handler(BaseHTTPRequestHandler):
                     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ai_executor:
                         ai_future = ai_executor.submit(task_ask_gemini, prompt)
                         try:
-                            # 4.5秒限時
-                            ai_reply = ai_future.result(timeout=4.5) 
+                            # 🔥 延長超時到 7 秒，給 AI 足夠時間思考
+                            ai_reply = ai_future.result(timeout=7.0) 
                         except concurrent.futures.TimeoutError:
-                            print("[WARN] Gemini 2.5 還是超時了！")
+                            print("[WARN] Gemini 思考超時 (超過 7 秒)")
                             ai_reply = "⚠️ **AI 連線逾時** (網路壅塞，請參考上方數據)"
                         except Exception:
                             ai_reply = "⚠️ AI 發生錯誤"
