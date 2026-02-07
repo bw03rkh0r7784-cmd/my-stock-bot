@@ -13,6 +13,7 @@ import google.generativeai as genai
 from bs4 import BeautifulSoup
 import time
 import traceback
+import concurrent.futures # 引入平行運算模組
 
 # --- 環境變數 ---
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN")
@@ -28,7 +29,8 @@ def send_telegram_message(chat_id, text):
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
     try:
-        requests.post(url, json=payload, timeout=5)
+        # 發送訊息也設個超時，避免卡死
+        requests.post(url, json=payload, timeout=3)
     except Exception as e:
         print(f"[ERROR] 發送訊息失敗: {e}")
 
@@ -37,6 +39,7 @@ def get_technical_analysis(stock_id):
     print(f"[DEBUG] 開始抓取 Yahoo 技術指標: {stock_id}")
     try:
         headers = {'User-Agent': 'Mozilla/5.0'}
+        # 嚴格限時 2 秒
         timeout_val = 2 
         
         # 1. 嘗試上市 (.TW)
@@ -79,51 +82,68 @@ def get_technical_analysis(stock_id):
         print(f"[ERROR] 技術指標失敗: {e}")
         return None
 
-# --- 新聞搜尋 (v3.0 權威白名單鎖定) ---
-def search_dual_news(stock_id):
-    print(f"[DEBUG] 開始搜尋新聞 (權威鎖定模式): {stock_id}")
+# --- 單一 RSS 抓取函式 (給執行緒用的) ---
+def fetch_rss_thread(url, tag):
+    res_list = []
+    try:
+        # 每個請求限時 2.5 秒
+        r = requests.get(url, timeout=2.5)
+        if r.status_code == 200:
+            soup = BeautifulSoup(r.content, features="xml")
+            items = soup.find_all("item", limit=2) # 限制抓 2 則
+            for item in items:
+                title = item.title.text.split(" - ")[0]
+                link = item.link.text
+                
+                # 簡單的來源標記
+                source = "媒體"
+                if "cnyes" in link: source = "鉅亨"
+                elif "moneydj" in link: source = "MoneyDJ"
+                elif "reuters" in link: source = "路透"
+                elif "bloomberg" in link: source = "彭博"
+                elif "udn" in link: source = "經濟"
+                elif "ctee" in link: source = "工商"
+                
+                res_list.append(f"• [{source}] [{title}]({link})")
+    except Exception as e:
+        print(f"[DEBUG] RSS {tag} 抓取失敗: {e}")
+    return res_list
+
+# --- 新聞搜尋 (v3.1 平行加速版) ---
+def search_dual_news_parallel(stock_id):
+    print(f"[DEBUG] 開始搜尋新聞 (平行加速模式): {stock_id}")
+    start_time = time.time()
     
-    # 🔥 1. 國內權威白名單 (鉅亨, MoneyDJ, 工商, 經濟, 數位時代)
-    # 語法解釋：site:A OR site:B 代表「只搜尋這些網站」
+    # 權威白名單
     tw_sources = "site:cnyes.com OR site:moneydj.com OR site:ctee.com.tw OR site:udn.com OR site:bnext.com.tw"
-    # 關鍵字：代號 + 關鍵字 + 白名單 + 24小時內
-    url_tw = f"https://news.google.com/rss/search?q={stock_id}+({tw_sources})+when:1d&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
-    
-    # 🔥 2. 國際權威白名單 (Reuters, Bloomberg, CNBC, WSJ)
     en_sources = "site:reuters.com OR site:bloomberg.com OR site:cnbc.com OR site:wsj.com"
-    # 關鍵字：代號 + Taiwan + 白名單 + 24小時內
-    url_en = f"https://news.google.com/rss/search?q={stock_id}+Taiwan+({en_sources})+when:1d&hl=en-US&gl=US&ceid=US:en"
+    
+    url_tw = f"https://news.google.com/rss/search?q={stock_id}+({tw_sources})+訂單+外資+when:1d&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
+    url_en = f"https://news.google.com/rss/search?q={stock_id}+Taiwan+({en_sources})+supply+chain+when:1d&hl=en-US&gl=US&ceid=US:en"
 
     news_text = ""
-    
-    def fetch_rss(url):
-        res_list = []
-        try:
-            r = requests.get(url, timeout=2.5) # 給權威媒體多 0.5 秒
-            if r.status_code == 200:
-                soup = BeautifulSoup(r.content, features="xml")
-                items = soup.find_all("item", limit=2) # 各抓 2 則精華
-                for item in items:
-                    title = item.title.text.split(" - ")[0]
-                    link = item.link.text
-                    # 顯示來源網站名稱 (從 URL 判斷，增加辨識度)
-                    source_tag = "權威媒體"
-                    if "cnyes" in link: source_tag = "鉅亨網"
-                    elif "moneydj" in link: source_tag = "MoneyDJ"
-                    elif "reuters" in link: source_tag = "Reuters"
-                    elif "bloomberg" in link: source_tag = "Bloomberg"
-                    elif "ctee" in link: source_tag = "工商時報"
-                    
-                    res_list.append(f"• [{source_tag}] [{title}]({link})")
-        except: pass
-        return res_list
+    list_tw = []
+    list_en = []
 
-    list_tw = fetch_rss(url_tw)
-    list_en = fetch_rss(url_en)
+    # 🔥 使用 ThreadPoolExecutor 同時發送兩個請求
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        # 發送任務
+        future_tw = executor.submit(fetch_rss_thread, url_tw, "TW")
+        future_en = executor.submit(fetch_rss_thread, url_en, "EN")
+        
+        # 等待結果 (最多等 3 秒，超過就放棄，避免卡死)
+        try:
+            list_tw = future_tw.result(timeout=3)
+        except: list_tw = []
+        
+        try:
+            list_en = future_en.result(timeout=3)
+        except: list_en = []
+
+    print(f"[DEBUG] 新聞搜尋完成，耗時: {time.time() - start_time:.2f}秒")
 
     if not list_tw and not list_en:
-        # 如果權威媒體都沒報，代表這支股票今天「沒量、沒人氣」，這也是重要訊號
-        return "（過去 24h 無權威媒體報導，可能無法人關注）"
+        return "（24h 無權威媒體報導，可能量縮無大人顧）"
 
     if list_tw: news_text += "【🇹🇼 權威內資 (24h)】：\n" + "\n".join(list_tw) + "\n"
     if list_en: news_text += "\n【🇺🇸 權威外資 (24h)】：\n" + "\n".join(list_en) + "\n"
@@ -152,9 +172,9 @@ class handler(BaseHTTPRequestHandler):
                     stock_id = user_text
                     
                     # 1. 回報收到
-                    send_telegram_message(chat_id, f"⚡ v3.0 權威信賴版啟動：{stock_id}...")
+                    send_telegram_message(chat_id, f"⚡ v3.1 平行加速版：{stock_id} 分析中...")
 
-                    # A. 抓即時股價
+                    # A. 抓即時股價 (twstock)
                     try:
                         stock = twstock.realtime.get(stock_id)
                     except:
@@ -164,23 +184,19 @@ class handler(BaseHTTPRequestHandler):
                         try:
                             price = float(stock['realtime']['latest_trade_price'])
                         except:
-                            try:
-                                price = float(stock['realtime']['best_bid_price'][0])
-                            except:
-                                price = 0
+                            try: price = float(stock['realtime']['best_bid_price'][0])
+                            except: price = 0
                         
-                        # 漲幅計算
                         try:
                             open_price = float(stock['realtime']['open'])
                             change_pct = ((price - open_price) / open_price) * 100
-                        except:
-                            change_pct = 0
+                        except: change_pct = 0
                             
                         safety_price = price * 0.985
 
-                        # B. 技術指標
+                        # B. 技術指標 (Yahoo)
                         tech_data = get_technical_analysis(stock_id)
-                        tech_str = "（Yahoo 連線逾時）"
+                        tech_str = "（Yahoo 逾時）"
                         if tech_data:
                             tech_str = f"""
                             - 5MA (地板): {tech_data['ma5']}
@@ -188,31 +204,30 @@ class handler(BaseHTTPRequestHandler):
                             - 乖離率: {tech_data['bias_5']}%
                             """
 
-                        # C. 新聞 (權威白名單)
-                        news_info = search_dual_news(stock_id)
+                        # C. 新聞 (使用平行加速版)
+                        news_info = search_dual_news_parallel(stock_id)
 
-                        # D. Gemini 分析 (Prompt 更新：強調公信力)
+                        # D. Gemini 分析
                         print("[DEBUG] 呼叫 Gemini...")
                         prompt = f"""
-                        你是嚴格的台股操盤教練，只依據【權威數據】判斷。
+                        你是嚴格的台股操盤教練，只信賴權威數據。
                         股票：{stock_id}，現價：{price} (漲幅 {change_pct:.2f}%)
                         技術：{tech_str}
-                        新聞來源：{news_info}
+                        權威新聞：{news_info}
                         
-                        請嚴格執行【v3.0 權威策略分析】：
+                        請嚴格執行【v3.1 權威策略漏斗】：
 
                         🔗 **1. 供應鏈與富爸爸 (Identity)**
                         - 它是誰的關鍵供應商？(如 NVIDIA, Apple)
-                        - 富爸爸(客戶)現況如何？有無利空連動？
+                        - 富爸爸(客戶)現況如何？有無連動風險？
 
                         📏 **2. 價格與技術 (Static)**
                         - 支撐：股價是否站穩 5MA？
                         - 壓力：是否觸碰布林上軌或乖離過大？
 
                         💰 **3. 籌碼與權威觀點 (Credibility)**
-                        - **內資動向**：鉅亨/工商等權威媒體是否提及法人(外資/投信)買賣超？
-                        - **外資觀點**：若有 Reuters/Bloomberg 報導，外資對該產業展望是正面還負面？
-                        - **防詐警示**：若無權威新聞，請警告「缺乏法人背書，小心假突破」。
+                        - **掃描新聞**：權威媒體(鉅亨/路透)有無提到法人(外資/投信)動向？
+                        - **防詐判斷**：若無權威報導，請警告「無法人背書，小心假拉抬」。
 
                         🏹 **4. 最終指令 (Action)**
                         - 給出指令：(買進 / 觀望 / 賣出 / 空手)。
@@ -222,11 +237,8 @@ class handler(BaseHTTPRequestHandler):
                         """
                         
                         ai_reply = ""
-                        # 模型優化：Flash 優先
-                        model_list = [                            
-                            'gemini-3-flash-preview',
-                            'gemini-2.5-flash'
-                        ]
+                        # 模型優化：優先使用 Flash
+                        model_list = ['gemini-3-flash-preview', 'gemini-2.5-flash']
                         
                         for model_name in model_list:
                             try:
@@ -235,9 +247,7 @@ class handler(BaseHTTPRequestHandler):
                                 response = model.generate_content(prompt)
                                 ai_reply = response.text
                                 break 
-                            except Exception as e:
-                                print(f"[ERROR] 模型 {model_name} 失敗: {e}")
-                                continue
+                            except: continue
 
                         if not ai_reply:
                             ai_reply = "⚠️ AI 連線失敗。"
