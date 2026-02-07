@@ -23,30 +23,51 @@ def send_telegram_message(chat_id, text):
     except Exception as e:
         print(f"TG Send Error: {e}")
 
-# --- 輔助函式：搜尋 Google News RSS ---
-def search_news(stock_id):
+# --- 內部工具：抓取單一 RSS 來源 ---
+def fetch_rss_feed(url, limit=2):
+    news_list = []
     try:
-        url = f"https://news.google.com/rss/search?q={stock_id}+tw+stock&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
-        response = requests.get(url, timeout=4)
-        
+        response = requests.get(url, timeout=3)
         if response.status_code == 200:
             soup = BeautifulSoup(response.content, features="xml")
-            items = soup.find_all("item", limit=3)
-            
-            if not items:
-                return "（無相關新聞）"
-                
-            news_text = "【焦點新聞】：\n"
+            items = soup.find_all("item", limit=limit)
             for item in items:
-                title = item.title.text.split(" - ")[0]
-                news_text += f"• {title}\n"
-            return news_text
-            
+                title = item.title.text
+                link = item.link.text
+                # Google RSS 標題格式通常是 "標題 - 媒體名稱"
+                # 我們保留這個格式，這樣就知道是哪家媒體報導的
+                news_list.append(f"• [{title}]({link})")
     except Exception as e:
-        print(f"News Error: {e}")
-        return "（新聞連線異常，跳過分析）"
+        print(f"RSS Fetch Error: {e}")
+    return news_list
+
+# --- 核心功能：雙軌新聞搜尋 (國內 + 國際) ---
+def search_dual_news(stock_id):
+    # 1. 國內新聞 (台灣地區, 中文, 過去24小時)
+    # 關鍵字：股票代號 (例如 2330)
+    url_tw = f"https://news.google.com/rss/search?q={stock_id}+when:1d&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
     
-    return "（查無資料）"
+    # 2. 國際新聞 (美國地區, 英文, 過去24小時)
+    # 關鍵字：股票代號 + "Taiwan" (例如 2330 Taiwan) 以確保搜到該股的英文報導
+    # 這樣可以搜到 Reuters, Bloomberg 對台股的英文報導
+    url_en = f"https://news.google.com/rss/search?q={stock_id}+Taiwan+stock+when:1d&hl=en-US&gl=US&ceid=US:en"
+
+    news_text = ""
+    
+    # --- 執行搜尋 ---
+    list_tw = fetch_rss_feed(url_tw, limit=2) # 抓 2 則中文
+    list_en = fetch_rss_feed(url_en, limit=2) # 抓 2 則英文
+
+    if not list_tw and not list_en:
+        return "（過去 24 小時內無國內外重大新聞）"
+
+    if list_tw:
+        news_text += "【🇹🇼 國內焦點 (24h)】：\n" + "\n".join(list_tw) + "\n"
+    
+    if list_en:
+        news_text += "\n【🇺🇸 國際觀點 (24h)】：\n" + "\n".join(list_en) + "\n"
+        
+    return news_text
 
 # --- 核心處理邏輯 ---
 class handler(BaseHTTPRequestHandler):
@@ -69,7 +90,7 @@ class handler(BaseHTTPRequestHandler):
                 if user_text.isdigit() and len(user_text) == 4:
                     stock_id = user_text
                     
-                    send_telegram_message(chat_id, f"🔍 收到 {stock_id}，正在啟用最新模型 (2.5/3.0) 分析中...")
+                    send_telegram_message(chat_id, f"🔍 收到 {stock_id}，正在進行【雙軌新聞掃描】與【策略漏斗分析】...")
 
                     # A. 抓股價
                     try:
@@ -84,41 +105,48 @@ class handler(BaseHTTPRequestHandler):
                         elif price == '-':
                             price = "暫無報價"
 
-                        # B. 搜新聞
-                        news_info = search_news(stock_id)
+                        # B. 雙軌搜新聞 (國內+國際)
+                        news_info = search_dual_news(stock_id)
 
                         # C. Gemini 分析
                         prompt = f"""
-                        你是嚴格的台股教練。
+                        你是嚴格的台股量化教練。
                         股票：{stock_id}
                         現價：{price}
-                        新聞：
+                        新聞資料：
                         {news_info}
                         
-                        請根據以上資訊，用『繁體中文』進行【策略漏斗分析】：
-                        1. 技術與動能判斷。
-                        2. 新聞面解讀。
-                        3. 給出明確操作指令 (買進/觀望/賣出)。
-                        請限制在 100 字以內。
+                        請根據以上資訊，嚴格執行【2.2版 核心過濾漏斗】：
+                        
+                        🛡️ **第一關：技術動能**
+                        - 判斷漲跌與動能。
+
+                        🛡️ **第二關：美股濾鏡 (國際新聞)**
+                        - 根據【國際觀點】新聞，判斷外資對該產業(如半導體/AI)的態度。
+                        - 若無國際新聞，請註明「無國際連動資訊」。
+
+                        🛡️ **第三關：籌碼與消息**
+                        - 根據【國內焦點】判斷是否有法人連買或主力動向。
+
+                        🧠 **教練指令 (操作建議)**
+                        - 綜合判斷後，給出明確指令：(買進 / 觀望 / 賣出 / 空手)。
+                        - 若有重大利空，請觸發「恐慌預警」。
+
+                        請用繁體中文，條列式回答，限制 150 字以內。
                         """
                         
                         ai_reply = ""
                         error_log = ""
                         success_model = ""
                         
-                        # --- 2026年 2月 最新模型清單 ---
-                        # 根據 Google 官方公告：
-                        # 1. gemini-2.5-flash (目前主力穩定版)
-                        # 2. gemini-3-flash-preview (最新一代預覽版)
-                        # 3. gemini-2.0-flash (將於 2026/3/31 退休)
+                        # 2026年 2月 最新模型清單
                         model_list = [
-                            'gemini-3-pro', # 嘗試：3.0PRO 
-                            'gemini-3-flash', # 嘗試：3.0 
-                            'gemini-2.5-flash',       # 優先：2.5 穩定版
-                            'gemini-2.0-flash',       # 次選：2.0 舊版 (尚未退休)
-                            
-                            'gemini-2.0-flash-exp',   # 備用：2.0 實驗版
-                            'gemini-1.5-flash'        # 最後手段：1.5 (可能已失效)
+                            'gemini-3-pro-preview',
+                            'gemini-3-flash-preview',
+                            'gemini-2.5-flash',
+                            'gemini-2.0-flash',                            
+                            'gemini-2.0-flash-exp',
+                            'gemini-1.5-flash'
                         ]
                         
                         for model_name in model_list:
@@ -129,17 +157,15 @@ class handler(BaseHTTPRequestHandler):
                                 success_model = model_name
                                 break 
                             except Exception as e:
-                                error_msg = str(e)
-                                # 紀錄錯誤但不中斷，繼續試下一個
-                                error_log += f"\n❌ {model_name}: 失敗"
+                                error_log += f"\n❌ {model_name}: Fail"
                                 continue
 
                         if not ai_reply:
-                            ai_reply = f"⚠️ 所有模型皆連線失敗。\n請檢查 API Key 權限。\n錯誤紀錄：{error_log}"
+                            ai_reply = f"⚠️ AI 連線失敗。\n錯誤紀錄：{error_log}"
                         else:
-                            ai_reply += f"\n(🤖 使用模型：{success_model})"
+                            ai_reply += f"\n(🤖 模型：{success_model})"
 
-                        final_msg = f"📊 **{stock_id} 分析報告**\n💰 現價：{price}\n\n{ai_reply}\n\n{news_info}"
+                        final_msg = f"📊 **{stock_id} 雙軌分析報告**\n💰 現價：{price}\n\n{ai_reply}\n\n{news_info}"
                         send_telegram_message(chat_id, final_msg)
 
                     else:
