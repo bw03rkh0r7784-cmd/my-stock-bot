@@ -3,3 +3,5 @@ google-generativeai
 requests
 lxml
 beautifulsoup4
+yfinance
+pandas
