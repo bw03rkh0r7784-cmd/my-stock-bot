@@ -112,9 +112,11 @@ class handler(BaseHTTPRequestHandler):
                         # 2. gemini-3-flash-preview (最新一代預覽版)
                         # 3. gemini-2.0-flash (將於 2026/3/31 退休)
                         model_list = [
+                            'gemini-3-pro', # 嘗試：3.0PRO 
+                            'gemini-3-flash', # 嘗試：3.0 
                             'gemini-2.5-flash',       # 優先：2.5 穩定版
                             'gemini-2.0-flash',       # 次選：2.0 舊版 (尚未退休)
-                            'gemini-3-flash-preview', # 嘗試：3.0 預覽版
+                            
                             'gemini-2.0-flash-exp',   # 備用：2.0 實驗版
                             'gemini-1.5-flash'        # 最後手段：1.5 (可能已失效)
                         ]
