@@ -1,3 +1,8 @@
+# --- 1. 強力鎮壓警告 (必須放在最上面) ---
+import warnings
+warnings.simplefilter(action='ignore', category=FutureWarning)
+warnings.filterwarnings("ignore")
+
 from http.server import BaseHTTPRequestHandler
 import os
 import json
