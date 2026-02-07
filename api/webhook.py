@@ -3,13 +3,14 @@ import warnings
 warnings.simplefilter(action='ignore', category=FutureWarning)
 warnings.filterwarnings("ignore")
 
+# --- 2. 開始匯入套件 ---
 from http.server import BaseHTTPRequestHandler
 import os
 import json
 import requests
 import twstock
 import statistics
-import google.generativeai as genai
+import google.generativeai as genai # 舊版 SDK (最穩定)
 from bs4 import BeautifulSoup
 import time
 
@@ -30,30 +31,27 @@ def send_telegram_message(chat_id, text):
     except Exception as e:
         print(f"TG Send Error: {e}")
 
-# --- 輕量化技術指標計算 (不使用 pandas/yfinance) ---
+# --- 輕量化技術指標計算 (Yahoo API 直連版) ---
 def get_technical_analysis(stock_id):
     try:
-        # 嘗試抓取上市或上櫃數據
-        # Yahoo API: range=1mo (一個月), interval=1d (日K)
         headers = {'User-Agent': 'Mozilla/5.0'}
         
-        # 先試上市 (.TW)
+        # 嘗試上市 (.TW)
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{stock_id}.TW?range=2mo&interval=1d"
         r = requests.get(url, headers=headers, timeout=3)
         data = r.json()
         
-        # 如果沒資料，改試上櫃 (.TWO)
+        # 嘗試上櫃 (.TWO)
         if data['chart']['result'] is None:
             url = f"https://query1.finance.yahoo.com/v8/finance/chart/{stock_id}.TWO?range=2mo&interval=1d"
             r = requests.get(url, headers=headers, timeout=3)
             data = r.json()
 
-        # 解析 JSON
         result = data['chart']['result'][0]
         quote = result['indicators']['quote'][0]
         close_prices = quote['close']
         
-        # 過濾掉 None (有時候會有空值)
+        # 過濾空值
         clean_prices = [p for p in close_prices if p is not None]
 
         if len(clean_prices) < 20:
@@ -64,7 +62,7 @@ def get_technical_analysis(stock_id):
         # 1. 計算 5MA (地板)
         ma5 = statistics.mean(clean_prices[-5:])
         
-        # 2. 計算 布林上軌 (20MA + 2std)
+        # 2. 計算 布林上軌 (天花板)
         ma20 = statistics.mean(clean_prices[-20:])
         stdev = statistics.stdev(clean_prices[-20:])
         upper_band = ma20 + (2 * stdev)
@@ -79,14 +77,14 @@ def get_technical_analysis(stock_id):
         }
 
     except Exception as e:
-        print(f"Lightweight Tech Error: {e}")
+        print(f"Tech Error: {e}")
         return None
 
 # --- 輔助函式：搜尋 Google News RSS (雙軌 + 24h) ---
 def search_dual_news(stock_id):
     # 國內新聞
     url_tw = f"https://news.google.com/rss/search?q={stock_id}+訂單+展望+when:1d&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
-    # 國際新聞
+    # 國際新聞 (供應鏈關鍵字)
     url_en = f"https://news.google.com/rss/search?q={stock_id}+supply+chain+major+customer+when:1d&hl=en-US&gl=US&ceid=US:en"
 
     news_text = ""
@@ -137,20 +135,10 @@ class handler(BaseHTTPRequestHandler):
                 if user_text.isdigit() and len(user_text) == 4:
                     stock_id = user_text
                     
-                    # 抓個即時價來顯示
-                    try:
-                        stock = twstock.realtime.get(stock_id)
-                        if stock['success']:
-                             price = float(stock['realtime']['latest_trade_price'])
-                        else:
-                             price = 0
-                    except:
-                        price = 0
+                    # 快速回報
+                    send_telegram_message(chat_id, f"🔍 收到 {stock_id}，正在啟動【v2.7 極速分析】(已修復警告)...")
 
-                    send_telegram_message(chat_id, f"🔍 收到 {stock_id}，正在啟動【輕量化極速分析】...")
-
-                    # A. 抓即時股價 (再次確認準確度)
-                    # twstock 還是抓即時最快，保留
+                    # A. 抓即時股價 (twstock)
                     try:
                         stock = twstock.realtime.get(stock_id)
                     except:
@@ -162,17 +150,17 @@ class handler(BaseHTTPRequestHandler):
                         except:
                             price = float(stock['realtime']['best_bid_price'][0]) if stock['realtime']['best_bid_price'] else 0
                         
-                        # RS 指標用的漲幅
+                        # RS漲幅
                         open_price = float(stock['realtime']['open'])
                         if open_price > 0:
                             change_pct = ((price - open_price) / open_price) * 100
                         else:
                             change_pct = 0
                         
-                        # 🔥 保命價計算
+                        # 🔥 保命價
                         safety_price = price * 0.985
 
-                        # B. 技術指標 (改用輕量版函式)
+                        # B. 技術指標 (Yahoo)
                         tech_data = get_technical_analysis(stock_id)
                         tech_str = "（技術指標讀取失敗）"
                         if tech_data:
@@ -199,7 +187,7 @@ class handler(BaseHTTPRequestHandler):
                         【最新情報 (24h)】
                         {news_info}
                         
-                        請嚴格執行【v2.6 供應鏈與價格斷面分析】：
+                        請嚴格執行【v2.7 供應鏈與價格斷面分析】：
 
                         🔗 **1. 供應鏈身分與富爸爸**
                         - 指出它是誰的關鍵供應商？(例: NVIDIA, Tesla, Apple)
@@ -222,7 +210,7 @@ class handler(BaseHTTPRequestHandler):
                         """
                         
                         ai_reply = ""
-                        # 模型輪替
+                        # 模型輪替 (嘗試多種名稱以確保成功)
                         model_list = ['gemini-3-pro-preview', 'gemini-3-flash-preview', 'gemini-2.0-flash', 'gemini-1.5-flash', 'gemini-pro']
                         
                         success_model = ""
