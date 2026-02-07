@@ -96,7 +96,7 @@ def task_technical_analysis(stock_id):
         }
     except: return None
 
-# --- [任務 B] 新聞抓取 (過濾垃圾連結) ---
+# --- [任務 B] 新聞抓取 ---
 def task_fetch_news(url):
     res_list = []
     try:
@@ -107,11 +107,7 @@ def task_fetch_news(url):
             for item in items:
                 title = item.title.text.split(" - ")[0]
                 link = item.link.text
-                
-                # 過濾掉 sitemap 或 xml 結尾的垃圾連結
-                if "sitemap" in link or link.endswith(".xml"):
-                    continue
-
+                if "sitemap" in link or link.endswith(".xml"): continue
                 source = "媒體"
                 if "cnyes" in link: source = "鉅亨"
                 elif "moneydj" in link: source = "MoneyDJ"
@@ -123,12 +119,13 @@ def task_fetch_news(url):
     except: pass
     return res_list
 
-# --- [任務 C] Gemini 生成 (放寬限制，確保完整回答) ---
+# --- [任務 C] Gemini 生成 (修正模型清單) ---
 def task_ask_gemini(prompt):
+    # 🔥 v4.1 修正：移除 1.5，改用 Lite 當主力
     model_priority = [
-        'gemini-2.5-flash',       # 主力
-        'gemini-2.5-flash-lite',  # 備援
-        'gemini-3-flash-preview'  # 嘗鮮
+        'gemini-2.5-flash-lite',  # 主力：速度極快，額度應較高
+        'gemini-3-flash-preview', # 備用：預覽版額度通常不錯
+        'gemini-2.5-flash'        # 最後手段：每日 20 次限制
     ]
     
     for model_name in model_priority:
@@ -137,25 +134,22 @@ def task_ask_gemini(prompt):
             model = genai.GenerativeModel(
                 model_name,
                 generation_config=genai.types.GenerationConfig(
-                    max_output_tokens=800, # 🔥 放寬字數限制，避免話講一半
-                    temperature=0.7        # 稍微提高創造力，讓語句更通順
+                    max_output_tokens=800, 
+                    temperature=0.7
                 )
             )
             response = model.generate_content(prompt)
-            # 確保回傳內容不為空
             if response.text:
                 return f"(🤖 {model_name})\n{response.text}"
         except Exception as e:
             print(f"[AI ERROR] {model_name} 失敗: {e}")
             continue
             
-    return None
+    return "⚠️ **AI 全面額度已滿或連線失敗**"
 
 # --- 核心處理邏輯 ---
 class handler(BaseHTTPRequestHandler):
     def do_POST(self):
-        start_total = time.time()
-        
         try:
             content_length = int(self.headers.get('Content-Length', 0))
             if content_length == 0:
@@ -184,10 +178,10 @@ class handler(BaseHTTPRequestHandler):
                     url_tw = f"https://news.google.com/rss/search?q={term_tw}+({tw_sources})+訂單+外資+when:1d&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
                     url_en = f"https://news.google.com/rss/search?q={stock_id}+Taiwan+({en_sources})+supply+chain+when:1d&hl=en-US&gl=US&ceid=US:en"
 
-                    send_telegram_message(chat_id, f"⚡ v3.9 穩定分析中：{stock_id} {stock_name}...")
+                    send_telegram_message(chat_id, f"⚡ v4.1 Lite極速版：{stock_id} {stock_name}...")
 
                     # ==========================================
-                    # 🚀 階段一：平行抓資料 (3秒內)
+                    # 🚀 平行抓資料
                     # ==========================================
                     tech_data = None
                     list_tw = []
@@ -238,13 +232,12 @@ class handler(BaseHTTPRequestHandler):
                     if not news_info: news_info = "無權威新聞"
 
                     # ==========================================
-                    # 🚀 階段二：Gemini 生成 (延長至 7 秒)
+                    # 🚀 Gemini 生成 (Lite 優先)
                     # ==========================================
                     print("[DEBUG] 呼叫 Gemini...")
                     
-                    # 🔥 Prompt 優化：命令它直接開始分析，不要說廢話
                     prompt = f"""
-                    你現在是量化交易系統。直接輸出分析結果，不要說「好的」或「以下是分析」。
+                    你現在是量化交易系統。直接輸出分析結果。
                     
                     【標的】{stock_id} {stock_name}
                     【數據】現價 {price} (漲幅 {change_pct:.2f}%)
@@ -266,11 +259,11 @@ class handler(BaseHTTPRequestHandler):
                     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ai_executor:
                         ai_future = ai_executor.submit(task_ask_gemini, prompt)
                         try:
-                            # 🔥 延長超時到 7 秒，給 AI 足夠時間思考
+                            # 7秒超時
                             ai_reply = ai_future.result(timeout=7.0) 
                         except concurrent.futures.TimeoutError:
-                            print("[WARN] Gemini 思考超時 (超過 7 秒)")
-                            ai_reply = "⚠️ **AI 連線逾時** (網路壅塞，請參考上方數據)"
+                            print("[WARN] Gemini 思考超時")
+                            ai_reply = "⚠️ **AI 連線逾時** (請參考上方數據)"
                         except Exception:
                             ai_reply = "⚠️ AI 發生錯誤"
 
