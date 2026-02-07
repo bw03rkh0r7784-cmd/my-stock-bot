@@ -210,7 +210,7 @@ class handler(BaseHTTPRequestHandler):
                         
                         ai_reply = ""
                         # 只嘗試兩個模型，節省時間
-                        model_list = ['gemini-2.0-flash', 'gemini-1.5-flash']
+                        model_list = ['gemini-3-pro-preview','gemini-3-flash-preview', 'gemini-2.5-flash']
                         
                         for model_name in model_list:
                             try:
