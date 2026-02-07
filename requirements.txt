@@ -2,3 +2,4 @@ twstock
 duckduckgo-search==5.3.0
 google-generativeai
 requests
+lxml
