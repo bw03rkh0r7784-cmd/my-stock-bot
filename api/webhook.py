@@ -6,6 +6,12 @@ import twstock
 import statistics
 import google.generativeai as genai
 from bs4 import BeautifulSoup
+import yfinance as yf
+import pandas as pd
+import warnings
+
+# --- 消除 Google SDK 的過期警告 (還你乾淨版面) ---
+warnings.filterwarnings("ignore", category=FutureWarning)
 
 # --- 環境變數 ---
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN")
@@ -24,28 +30,37 @@ def send_telegram_message(chat_id, text):
     except Exception as e:
         print(f"TG Send Error: {e}")
 
-# --- 輔助函式：計算技術指標 (MA & 布林 & 乖離) ---
+# --- 關鍵修復：使用 Yahoo Finance 計算技術指標 ---
 def get_technical_analysis(stock_id):
     try:
-        stock = twstock.Stock(stock_id)
-        # 抓取過去 31 天資料
-        data = stock.fetch_31()
+        # 1. 判斷上市(.TW) 或 上櫃(.TWO)
+        # 先嘗試上市代號
+        symbol = f"{stock_id}.TW"
+        stock = yf.Ticker(symbol)
+        df = stock.history(period="1mo") # 抓一個月資料
         
-        if len(data) < 20:
+        # 如果抓不到(空的)，改試上櫃代號
+        if df.empty:
+            symbol = f"{stock_id}.TWO"
+            stock = yf.Ticker(symbol)
+            df = stock.history(period="1mo")
+            
+        if df.empty or len(df) < 20:
             return None
 
-        close_prices = [entry.close for entry in data]
+        # 2. 提取收盤價序列
+        close_prices = df['Close'].tolist()
         current_price = close_prices[-1]
         
-        # 1. 5MA (生命線 / 地板)
+        # 3. 計算 5MA (生命線 / 地板)
         ma5 = statistics.mean(close_prices[-5:])
         
-        # 2. 布林通道上軌 (天花板) = 20MA + 2std
+        # 4. 計算布林通道 (20MA + 2個標準差)
         ma20 = statistics.mean(close_prices[-20:])
         stdev = statistics.stdev(close_prices[-20:])
         upper_band = ma20 + (2 * stdev)
         
-        # 3. 5日乖離率 (Bias)
+        # 5. 計算 5日乖離率 (Bias)
         bias_5 = ((current_price - ma5) / ma5) * 100
         
         return {
@@ -54,16 +69,15 @@ def get_technical_analysis(stock_id):
             "bias_5": round(bias_5, 2)
         }
     except Exception as e:
-        print(f"Tech Error: {e}")
+        print(f"Tech Error (Yahoo): {e}")
         return None
 
 # --- 輔助函式：搜尋 Google News RSS (雙軌 + 連結 + 24h) ---
 def search_dual_news(stock_id):
-    # 國內新聞：鎖定「訂單」、「營收」、「展望」+ 過去24小時
+    # 國內新聞：鎖定「訂單」、「營收」、「展望」
     url_tw = f"https://news.google.com/rss/search?q={stock_id}+訂單+展望+when:1d&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
     
-    # 國際新聞：鎖定「供應鏈」、「大客戶」+ 過去24小時
-    # 搜尋技巧：stock_id + "supply chain major customer"
+    # 國際新聞：鎖定「供應鏈」、「大客戶」
     url_en = f"https://news.google.com/rss/search?q={stock_id}+supply+chain+major+customer+when:1d&hl=en-US&gl=US&ceid=US:en"
 
     news_text = ""
@@ -78,7 +92,6 @@ def search_dual_news(stock_id):
                 for item in items:
                     title = item.title.text.split(" - ")[0]
                     link = item.link.text
-                    # 格式：[標題](連結)
                     res_list.append(f"• [{title}]({link})")
         except: pass
         return res_list
@@ -115,9 +128,9 @@ class handler(BaseHTTPRequestHandler):
                 if user_text.isdigit() and len(user_text) == 4:
                     stock_id = user_text
                     
-                    send_telegram_message(chat_id, f"🔍 收到 {stock_id}，正在啟動【供應鏈連動】與【保命價】計算...")
+                    send_telegram_message(chat_id, f"🔍 收到 {stock_id}，正在從 Yahoo 獲取數據並進行分析...")
 
-                    # A. 抓即時股價
+                    # A. 抓即時股價 (twstock 抓即時還是很快，保留使用)
                     try:
                         stock = twstock.realtime.get(stock_id)
                     except:
@@ -127,33 +140,32 @@ class handler(BaseHTTPRequestHandler):
                         try:
                             price = float(stock['realtime']['latest_trade_price'])
                         except:
-                            # 若無成交價 (試撮或暫停)，嘗試取最佳買價
                             price = float(stock['realtime']['best_bid_price'][0]) if stock['realtime']['best_bid_price'] else 0
                         
-                        # 計算今日漲跌幅 (RS 用)
+                        # 計算今日漲跌幅
                         open_price = float(stock['realtime']['open'])
                         if open_price > 0:
                             change_pct = ((price - open_price) / open_price) * 100
                         else:
                             change_pct = 0
                         
-                        # 🔥 計算保命價 (Safety Price = 現價 * 0.985)
+                        # 🔥 保命價計算
                         safety_price = price * 0.985
 
-                        # B. 計算技術指標
+                        # B. 計算技術指標 (改用 Yahoo Finance)
                         tech_data = get_technical_analysis(stock_id)
-                        tech_str = "（資料不足）"
+                        tech_str = "（Yahoo 數據讀取失敗，無法計算指標）"
                         if tech_data:
                             tech_str = f"""
                             - 5MA (地板): {tech_data['ma5']}
                             - 布林上軌 (天花板): {tech_data['upper_band']}
-                            - 5日乖離率: {tech_data['bias_5']}% (若過高留意回檔)
+                            - 5日乖離率: {tech_data['bias_5']}% (若 > 5% 視為過熱)
                             """
 
-                        # C. 搜尋雙軌新聞
+                        # C. 搜尋新聞
                         news_info = search_dual_news(stock_id)
 
-                        # D. Gemini 分析 (Prompt 包含 v2.4 策略)
+                        # D. Gemini 分析
                         prompt = f"""
                         你是嚴格的台股供應鏈分析師。
                         
@@ -161,13 +173,13 @@ class handler(BaseHTTPRequestHandler):
                         股票：{stock_id}
                         現價：{price} (今日漲幅: {change_pct:.2f}%)
                         
-                        【技術參數】
+                        【技術參數 (Yahoo Finance Source)】
                         {tech_str}
                         
                         【最新情報 (24h)】
                         {news_info}
                         
-                        請嚴格執行【v2.4 供應鏈與價格斷面分析】：
+                        請嚴格執行【v2.5 供應鏈與價格斷面分析】：
 
                         🔗 **1. 供應鏈身分與富爸爸 (Identity)**
                         - 指出它是誰的關鍵供應商？(例: NVIDIA, Tesla, Apple, TSMC)
@@ -192,15 +204,8 @@ class handler(BaseHTTPRequestHandler):
                         ai_reply = ""
                         error_log = ""
                         
-                        # 模型輪替清單 (包含 2.0 / 2.5 / 1.5 系列)
-                        model_list = [
-                            'gemini-3-pro-preview',
-                            'gemini-3-flash-preview',
-                            'gemini-2.0-flash',       # 2.0 正式版 (優先)
-                            'gemini-2.0-flash-exp',   # 2.0 實驗版
-                            'gemini-1.5-flash',       # 1.5 Flash (舊版備用)
-                            'gemini-pro'              # 通用舊版
-                        ]
+                        # 模型輪替清單
+                        model_list = ['gemini-3-pro-preview', 'gemini-3-flash-preview', 'gemini-2.0-flash', 'gemini-1.5-flash', 'gemini-pro']
                         
                         success_model = ""
                         for model_name in model_list:
