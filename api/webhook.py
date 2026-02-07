@@ -11,6 +11,7 @@ TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
 # --- 初始化 Gemini ---
+# 注意：使用 google-genai 新版 SDK
 client = genai.Client(api_key=GEMINI_API_KEY)
 
 # --- 輔助函式：發送 TG 訊息 ---
@@ -22,12 +23,12 @@ def send_telegram_message(chat_id, text):
     except Exception as e:
         print(f"TG Send Error: {e}")
 
-# --- 關鍵修正：改用 Google News RSS (速度快、不擋IP) ---
+# --- 輔助函式：搜尋 Google News RSS ---
 def search_news(stock_id):
     try:
-        # 針對台股代號搜尋 (例如: 2330 台積電)
+        # 針對台股代號搜尋
         url = f"https://news.google.com/rss/search?q={stock_id}+tw+stock&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
-        response = requests.get(url, timeout=4) # 設定 4 秒超時，避免卡死
+        response = requests.get(url, timeout=4)
         
         if response.status_code == 200:
             soup = BeautifulSoup(response.content, features="xml")
@@ -39,7 +40,7 @@ def search_news(stock_id):
             news_text = "【最新新聞】：\n"
             for item in items:
                 title = item.title.text
-                # 清理標題中多餘的來源名稱 (例如 "- Yahoo奇摩股市")
+                # 清理標題
                 title = title.split(" - ")[0]
                 news_text += f"• {title}\n"
             return news_text
@@ -54,6 +55,7 @@ def search_news(stock_id):
 class handler(BaseHTTPRequestHandler):
     def do_POST(self):
         try:
+            # 1. 檢查請求內容
             content_length = int(self.headers.get('Content-Length', 0))
             if content_length == 0:
                 self.send_response(200); self.end_headers(); return
@@ -64,6 +66,7 @@ class handler(BaseHTTPRequestHandler):
             except:
                 self.send_response(200); self.end_headers(); return
 
+            # 2. 處理 TG 訊息
             if "message" in data:
                 chat_id = data["message"]["chat"]["id"]
                 user_text = data["message"].get("text", "").strip()
@@ -72,27 +75,26 @@ class handler(BaseHTTPRequestHandler):
                 if user_text.isdigit() and len(user_text) == 4:
                     stock_id = user_text
                     
-                    # 1. 先回報「收到指令」(避免使用者以為當機)
-                    send_telegram_message(chat_id, f"🔍 收到 {stock_id}，正在分析中...")
+                    # 先回報收到指令
+                    send_telegram_message(chat_id, f"🔍 收到 {stock_id}，正在分析數據與新聞...")
 
-                    # 2. 抓股價 (twstock)
+                    # A. 抓股價
                     try:
                         stock = twstock.realtime.get(stock_id)
                     except:
-                        stock = {'success': False} # 防爆
+                        stock = {'success': False}
 
                     if stock.get('success'):
                         price = stock['realtime']['latest_trade_price']
-                        # 處理無成交價的情況
                         if price == '-' and stock['realtime']['best_bid_price']:
                             price = stock['realtime']['best_bid_price'][0]
                         elif price == '-':
                             price = "暫無報價"
 
-                        # 3. 搜新聞 (使用穩定的 RSS)
+                        # B. 搜新聞
                         news_info = search_news(stock_id)
 
-                        # 4. Gemini 綜合分析
+                        # C. Gemini 分析 (這裡修正了語法與模型名稱)
                         prompt = f"""
                         你是嚴格的台股教練。
                         股票：{stock_id}
@@ -107,30 +109,26 @@ class handler(BaseHTTPRequestHandler):
                         請限制在 120 字以內。
                         """
                         
-                        # 呼叫 Gemini (自動嘗試不同模型名稱)
-try:
-    # 優先嘗試最穩定的版本
-    response = client.models.generate_content(
-        model='gemini-1.5-flash-001',
-        contents=prompt
-    )
-except Exception:
-    try:
-        # 如果失敗，嘗試最新的 Pro 版
-        response = client.models.generate_content(
-            model='gemini-1.5-pro',
-            contents=prompt
-        )
-    except Exception as e:
-        response = type('obj', (object,), {'text': f"AI 模型連線失敗: {str(e)}"})
+                        ai_reply = ""
+                        try:
+                            # 嘗試使用標準穩定版模型
+                            response = client.models.generate_content(
+                                model='gemini-1.5-flash-001', # <--- 這裡改成了 -001
+                                contents=prompt
+                            )
+                            ai_reply = response.text
+                        except Exception as e:
+                            # 若失敗，印出錯誤但不崩潰
+                            ai_reply = f"⚠️ AI 分析暫時無法使用 ({str(e)})，請稍後再試。"
 
-                        # 5. 回傳最終報告
+                        # D. 回傳報告
                         final_msg = f"📊 **{stock_id} 分析報告**\n💰 現價：{price}\n\n{ai_reply}\n\n{news_info}"
                         send_telegram_message(chat_id, final_msg)
 
                     else:
-                        send_telegram_message(chat_id, f"❌ 找不到代號 {stock_id}，請確認是否正確。")
+                        send_telegram_message(chat_id, f"❌ 找不到代號 {stock_id}")
 
+            # 3. 回應 Vercel
             self.send_response(200)
             self.send_header('Content-type', 'application/json')
             self.end_headers()
