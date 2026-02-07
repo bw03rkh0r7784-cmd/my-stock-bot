@@ -1,5 +1,5 @@
 twstock
-google-genai
+google-generativeai
 requests
 lxml
 beautifulsoup4
