@@ -79,29 +79,42 @@ def get_technical_analysis(stock_id):
         print(f"[ERROR] 技術指標失敗: {e}")
         return None
 
-# --- 新聞搜尋 (關鍵字優化：加入外資投信) ---
+# --- 新聞搜尋 (v3.0 權威白名單鎖定) ---
 def search_dual_news(stock_id):
-    print(f"[DEBUG] 開始搜尋新聞: {stock_id}")
+    print(f"[DEBUG] 開始搜尋新聞 (權威鎖定模式): {stock_id}")
     
-    # 🇹🇼 國內：加入「外資、投信、主力」關鍵字，確保能抓到籌碼新聞
-    url_tw = f"https://news.google.com/rss/search?q={stock_id}+訂單+外資+投信+when:1d&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
+    # 🔥 1. 國內權威白名單 (鉅亨, MoneyDJ, 工商, 經濟, 數位時代)
+    # 語法解釋：site:A OR site:B 代表「只搜尋這些網站」
+    tw_sources = "site:cnyes.com OR site:moneydj.com OR site:ctee.com.tw OR site:udn.com OR site:bnext.com.tw"
+    # 關鍵字：代號 + 關鍵字 + 白名單 + 24小時內
+    url_tw = f"https://news.google.com/rss/search?q={stock_id}+({tw_sources})+when:1d&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
     
-    # 🇺🇸 國際：供應鏈與大客戶
-    url_en = f"https://news.google.com/rss/search?q={stock_id}+supply+chain+major+customer+when:1d&hl=en-US&gl=US&ceid=US:en"
+    # 🔥 2. 國際權威白名單 (Reuters, Bloomberg, CNBC, WSJ)
+    en_sources = "site:reuters.com OR site:bloomberg.com OR site:cnbc.com OR site:wsj.com"
+    # 關鍵字：代號 + Taiwan + 白名單 + 24小時內
+    url_en = f"https://news.google.com/rss/search?q={stock_id}+Taiwan+({en_sources})+when:1d&hl=en-US&gl=US&ceid=US:en"
 
     news_text = ""
     
     def fetch_rss(url):
         res_list = []
         try:
-            r = requests.get(url, timeout=2) # 放寬到 2 秒
+            r = requests.get(url, timeout=2.5) # 給權威媒體多 0.5 秒
             if r.status_code == 200:
                 soup = BeautifulSoup(r.content, features="xml")
-                items = soup.find_all("item", limit=2)
+                items = soup.find_all("item", limit=2) # 各抓 2 則精華
                 for item in items:
                     title = item.title.text.split(" - ")[0]
                     link = item.link.text
-                    res_list.append(f"• [{title}]({link})")
+                    # 顯示來源網站名稱 (從 URL 判斷，增加辨識度)
+                    source_tag = "權威媒體"
+                    if "cnyes" in link: source_tag = "鉅亨網"
+                    elif "moneydj" in link: source_tag = "MoneyDJ"
+                    elif "reuters" in link: source_tag = "Reuters"
+                    elif "bloomberg" in link: source_tag = "Bloomberg"
+                    elif "ctee" in link: source_tag = "工商時報"
+                    
+                    res_list.append(f"• [{source_tag}] [{title}]({link})")
         except: pass
         return res_list
 
@@ -109,10 +122,11 @@ def search_dual_news(stock_id):
     list_en = fetch_rss(url_en)
 
     if not list_tw and not list_en:
-        return "（24h 無新聞）"
+        # 如果權威媒體都沒報，代表這支股票今天「沒量、沒人氣」，這也是重要訊號
+        return "（過去 24h 無權威媒體報導，可能無法人關注）"
 
-    if list_tw: news_text += "【🇹🇼 內資/籌碼 (24h)】：\n" + "\n".join(list_tw) + "\n"
-    if list_en: news_text += "\n【🇺🇸 供應鏈/外資 (24h)】：\n" + "\n".join(list_en) + "\n"
+    if list_tw: news_text += "【🇹🇼 權威內資 (24h)】：\n" + "\n".join(list_tw) + "\n"
+    if list_en: news_text += "\n【🇺🇸 權威外資 (24h)】：\n" + "\n".join(list_en) + "\n"
         
     return news_text
 
@@ -138,7 +152,7 @@ class handler(BaseHTTPRequestHandler):
                     stock_id = user_text
                     
                     # 1. 回報收到
-                    send_telegram_message(chat_id, f"⚡ v2.9 全面分析啟動：{stock_id}...")
+                    send_telegram_message(chat_id, f"⚡ v3.0 權威信賴版啟動：{stock_id}...")
 
                     # A. 抓即時股價
                     try:
@@ -174,18 +188,18 @@ class handler(BaseHTTPRequestHandler):
                             - 乖離率: {tech_data['bias_5']}%
                             """
 
-                        # C. 新聞
+                        # C. 新聞 (權威白名單)
                         news_info = search_dual_news(stock_id)
 
-                        # D. Gemini 分析 (Prompt 更新：加入第三關籌碼)
+                        # D. Gemini 分析 (Prompt 更新：強調公信力)
                         print("[DEBUG] 呼叫 Gemini...")
                         prompt = f"""
-                        你是嚴格的台股操盤教練。
+                        你是嚴格的台股操盤教練，只依據【權威數據】判斷。
                         股票：{stock_id}，現價：{price} (漲幅 {change_pct:.2f}%)
                         技術：{tech_str}
-                        新聞：{news_info}
+                        新聞來源：{news_info}
                         
-                        請嚴格執行【v2.9 策略漏斗分析】：
+                        請嚴格執行【v3.0 權威策略分析】：
 
                         🔗 **1. 供應鏈與富爸爸 (Identity)**
                         - 它是誰的關鍵供應商？(如 NVIDIA, Apple)
@@ -195,10 +209,10 @@ class handler(BaseHTTPRequestHandler):
                         - 支撐：股價是否站穩 5MA？
                         - 壓力：是否觸碰布林上軌或乖離過大？
 
-                        💰 **3. 籌碼與消息 (Chips & News)**
-                        - **掃描新聞**：是否有「外資/投信」連買或賣超？
-                        - **判斷動向**：是「大戶進場」還是「主力出貨」？
-                        - 若無新聞，請註明「無顯著籌碼消息」。
+                        💰 **3. 籌碼與權威觀點 (Credibility)**
+                        - **內資動向**：鉅亨/工商等權威媒體是否提及法人(外資/投信)買賣超？
+                        - **外資觀點**：若有 Reuters/Bloomberg 報導，外資對該產業展望是正面還負面？
+                        - **防詐警示**：若無權威新聞，請警告「缺乏法人背書，小心假突破」。
 
                         🏹 **4. 最終指令 (Action)**
                         - 給出指令：(買進 / 觀望 / 賣出 / 空手)。
@@ -208,10 +222,10 @@ class handler(BaseHTTPRequestHandler):
                         """
                         
                         ai_reply = ""
-                        # 模型優化：Flash 優先 (避開 Pro 的配額問題)
-                        model_list = [
-                            'gemini-3-flash-preview',       # 首選
-                            'gemini-2.5-flash',   # 備用                            
+                        # 模型優化：Flash 優先
+                        model_list = [                            
+                            'gemini-3-flash-preview',
+                            'gemini-2.5-flash'
                         ]
                         
                         for model_name in model_list:
@@ -228,7 +242,7 @@ class handler(BaseHTTPRequestHandler):
                         if not ai_reply:
                             ai_reply = "⚠️ AI 連線失敗。"
 
-                        final_msg = f"📊 **{stock_id} 籌碼與供應鏈報告**\n💰 現價：{price}\n📉 **保命價：{round(safety_price, 2)}**\n\n{ai_reply}\n\n{news_info}"
+                        final_msg = f"📊 **{stock_id} 權威分析報告**\n💰 現價：{price}\n📉 **保命價：{round(safety_price, 2)}**\n\n{ai_reply}\n\n{news_info}"
                         send_telegram_message(chat_id, final_msg)
 
                     else:
